@@ -63,6 +63,10 @@ return {
     {
       title = LOC("$$$/MIDI2LR/Info/DeleteSettings=Delete settings"),
       file = "PrefReset.lua",
+    },
+    {
+      title = LOC("$$$/MIDI2LR/Menu/DumpDevelopSettings=Dump develop settings (diagnostic)"),
+      file = "DevelopSettingsProbe.lua",
     },--[[-----------development only, enable by adding - to beginning of comment
     {
       title = LOC("$$$/MIDI2LR/Info/BuildFiles=Build files (development use only)"),
