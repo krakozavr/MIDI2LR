@@ -861,13 +861,23 @@ LrTasks.startAsyncTask(
           LrApplicationView.switchToModule('develop')
           LrTasks.yield() -- need this to allow module change before value sent
         end
+        local param_val = getValue(param)
+        local min, max = Limits.GetMinMax(param, param_val)
         if Limits.Parameters[param] then
-          Limits.ClampValue(param)
+          if min ~= nil and max ~= nil then
+            local clamped = Limits.ClampValue(param, param_val, min, max)
+            if clamped ~= param_val then --value moved: fine mode window must enclose the new value
+              param_val = clamped
+              min, max = Limits.GetMinMax(param, param_val)
+            end
+          else
+            Limits.ClampValue(param)
+            param_val = getValue(param)
+          end
         end
         local current_time = LrDate.currentTime()
-        local midi_val_to_lr_val = MIDIValueToLRValue(param, midi_value_update)
-        local param_val = getValue(param)
-        local lrmidi = LRValueToMIDIValue(param)
+        local midi_val_to_lr_val = MIDIValueToLRValue(param, midi_value_update, min, max)
+        local lrmidi = LRValueToMIDIValue(param, param_val, min, max)
         local previous = lastmidi[param]
         lastmidi[param] = midi_value_update
         -- crossed: values skipped by coalescing may jump over the LR value without landing in threshold
@@ -922,8 +932,10 @@ LrTasks.startAsyncTask(
       end
       --Don't need to clamp limited parameters without pickup, as MIDI controls will still work
       --if value is outside limits range
-      value = MIDIValueToLRValue(param, midi_value)
-      if value ~= getValue(param) then
+      local cur = getValue(param)
+      local min, max = Limits.GetMinMax(param, cur)
+      value = MIDIValueToLRValue(param, midi_value, min, max)
+      if value ~= cur then
         MIDI2LR.PARAM_OBSERVER[param] = value
         setValue(param, value, MIDI2LR.AltOpt)
         LastParam = param

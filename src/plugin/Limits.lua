@@ -143,34 +143,41 @@ end
 -- control range. This function should not be called unless in develop with
 -- photo selected. Also check for existence of limits before calling.
 -- @param Parameter to clamp to limits.
--- @return nil.
+-- @param value optional: current LR value if already known
+-- @param min optional: lower limit if already known (used with max)
+-- @param max optional: upper limit if already known (used with min)
+-- @return value after clamping.
 --------------------------------------------------------------------------------
-local function ClampValue(param)
-  local value = LrDevelopController.getValue(param)
-  local min, max = GetMinMax(param, value)
+local function ClampValue(param, value, min, max)
+  value = value or LrDevelopController.getValue(param)
+  if min == nil or max == nil then
+    min, max = GetMinMax(param, value)
+  end
   if value < min then
     MIDI2LR.PARAM_OBSERVER[param] = min
     LrDevelopController.setValue(param, min)
+    value = min
   elseif value > max then
     MIDI2LR.PARAM_OBSERVER[param] = max
     LrDevelopController.setValue(param, max)
+    value = max
   end
-  return nil
+  return value
 end
 
-local function MIDIValueToLRValue(param, midi_value)
+local function MIDIValueToLRValue(param, midi_value, min, max)
   -- must be called when in develop module with photo selected
   -- map midi range to develop parameter range
   -- expects midi_value 0.0-1.0, doesn't protect against out-of-range
-  local min,max = GetMinMax(param)
+  if min == nil or max == nil then min,max = GetMinMax(param) end
   return midi_value * (max-min) + min
 end
 
-local function LRValueToMIDIValue(param, lr_value) -- lr_value optional
+local function LRValueToMIDIValue(param, lr_value, min, max) -- lr_value, min, max optional
   -- needs to be called in Develop module with photo selected
   -- map develop parameter range to midi range
   lr_value = lr_value or LrDevelopController.getValue(param)
-  local min,max = GetMinMax(param,lr_value)
+  if min == nil or max == nil then min,max = GetMinMax(param,lr_value) end
   local retval = (lr_value-min)/(max-min)
   if retval > 1 then return 1 end
   if retval < 0 then return 0 end
