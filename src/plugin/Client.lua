@@ -92,6 +92,7 @@ LrTasks.startAsyncTask(
     MIDI2LR = {PARAM_OBSERVER = {}, SERVER = {}, CLIENT = {}, RUNNING = true, AltOpt = false} --non-local but in MIDI2LR namespace
     --local variables
     local LastParam           = ''
+    local lastMidiApply       = 0 --time of last MIDI parameter application; slows observer scans while driving from MIDI
     local perf = {msgs = 0, params = 0, coalesced = 0, applied = 0, sum = 0, max = 0, last = 0} --used only if PERF_STATS
     local UpdateParamPickup, UpdateParamNoPickup, UpdateParam
     local sendIsConnected = false --tell whether send socket is up or not
@@ -959,26 +960,45 @@ LrTasks.startAsyncTask(
         local CurrentObserver
         --call following within guard for reading
         local function AdjustmentChangeObserver()
-          local lastrefresh = 0 --will be set to current time + increment to rate limit
+          local scanScheduled = false --true while a trailing scan task is pending
+          local lastScan = 0
+          local lastCrop = {}
           return function(observer) -- closure
             if not sendIsConnected then return end -- can't send
-            if Limits.LimitsCanBeSet() and lastrefresh < LrDate.currentTime() then
-              -- refresh crop values NOTE: this function is repeated in Limits
-              local midi_val_bottom = LRValueToMIDIValue('CropBottom')
-              local midi_val_top = LRValueToMIDIValue('CropTop')
-              local midi_val_left = LRValueToMIDIValue('CropLeft')
-              MIDI2LR.SERVER:send(string.format('CropBottomRight %g\nCropBottomLeft %g\nCropAll %g\nCropTopRight %g\nCropTopLeft %g\nCropMoveVertical %g\nCropMoveHorizontal %g\n',
-                  midi_val_bottom,midi_val_bottom,midi_val_bottom,midi_val_top,midi_val_top,midi_val_top,midi_val_left))
-              for param in pairs(Database.Parameters) do
-                local lrvalue = getValue(param)
-                if observer[param] ~= lrvalue and type(lrvalue) == 'number' then --testing for MIDI2LR.SERVER.send kills responsiveness
-                  MIDI2LR.SERVER:send(string.format('%s %g\n', param, LRValueToMIDIValue(param,lrvalue)))
-                  observer[param] = lrvalue
-                  LastParam = param
+            if scanScheduled then return end -- pending scan will pick up this change
+            scanScheduled = true
+            local obs = observer
+            LrTasks.startAsyncTask(function()
+                local interval = (LrDate.currentTime() - lastMidiApply < 0.3) and 0.25 or 0.1 --slower while MIDI is driving
+                local wait = lastScan + interval - LrDate.currentTime()
+                if wait > 0 then LrTasks.sleep(wait) end
+                scanScheduled = false --clear before scan so changes during scan schedule another pass
+                if sendIsConnected and Limits.LimitsCanBeSet() then
+                  local ok, err = LrTasks.pcall(function()
+                      -- refresh crop values NOTE: this function is repeated in Limits
+                      local midi_val_bottom = LRValueToMIDIValue('CropBottom')
+                      local midi_val_top = LRValueToMIDIValue('CropTop')
+                      local midi_val_left = LRValueToMIDIValue('CropLeft')
+                      if lastCrop.bottom ~= midi_val_bottom or lastCrop.top ~= midi_val_top or lastCrop.left ~= midi_val_left then
+                        lastCrop.bottom, lastCrop.top, lastCrop.left = midi_val_bottom, midi_val_top, midi_val_left
+                        MIDI2LR.SERVER:send(string.format('CropBottomRight %g\nCropBottomLeft %g\nCropAll %g\nCropTopRight %g\nCropTopLeft %g\nCropMoveVertical %g\nCropMoveHorizontal %g\n',
+                            midi_val_bottom,midi_val_bottom,midi_val_bottom,midi_val_top,midi_val_top,midi_val_top,midi_val_left))
+                      end
+                      for param in pairs(Database.Parameters) do
+                        local lrvalue = getValue(param)
+                        if obs[param] ~= lrvalue and type(lrvalue) == 'number' then --testing for MIDI2LR.SERVER.send kills responsiveness
+                          MIDI2LR.SERVER:send(string.format('%s %g\n', param, LRValueToMIDIValue(param,lrvalue)))
+                          obs[param] = lrvalue
+                          LastParam = param
+                        end
+                      end
+                    end)
+                  if not ok and sendIsConnected then
+                    MIDI2LR.SERVER:send('Log observer error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
+                  end
                 end
-              end
-              lastrefresh = LrDate.currentTime() + 0.1 --1/10 sec between refreshes
-            end
+                lastScan = LrDate.currentTime()
+              end)
           end
         end
         AdjustmentChangeObserver = AdjustmentChangeObserver() --complete closure
@@ -1143,6 +1163,7 @@ LrTasks.startAsyncTask(
         startServer(context)
 
         local function applyParam(param, num) --run via LrTasks.pcall as UpdateParam may yield
+          lastMidiApply = LrDate.currentTime()
           UpdateParam(param,num,false)
           local gradeFocus = GradeFocusTable[param]
           if gradeFocus then
