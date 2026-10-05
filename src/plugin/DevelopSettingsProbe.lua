@@ -28,12 +28,12 @@ local LrTasks           = import 'LrTasks'
 
 local patterns = {'denois', 'enhance', 'rawdetail', 'superres', 'reflection',
   'distraction', 'lensblur', 'pointcolor', 'colorvariance', 'ailook',
-  'aisetting', 'noise'}
+  'aisetting', 'noise', 'filter'}
 local guesses = {'Denoise', 'DenoiseAmount', 'EnableDenoise', 'AIDenoise',
   'AIDenoiseAmount', 'EnhanceDenoise', 'EnhanceDenoiseAmount', 'RawDetails',
   'EnableRawDetails', 'SuperResolution', 'EnableSuperResolution',
   'ReflectionRemoval', 'ReflectionRemovalAmount', 'EnableReflectionRemoval',
-  'EnableDistractionRemoval', 'LensBlurCatEye', 'ColorVariance', 'AILook'}
+  'EnableDistractionRemoval', 'LensBlurCatEye', 'ColorVariance', 'AILook', 'FilterList'}
 
 local function isCandidate(key)
   local lower = tostring(key):lower()
@@ -57,6 +57,17 @@ local function format(v)
     return truncate(ok and tostring(res) or ('<serpent error: ' .. tostring(res) .. '>'))
   end
   return truncate(tostring(v))
+end
+
+local function formatFull(v)
+  if type(v) == 'table' then
+    local ok, res = pcall(function()
+      local serpent = require 'serpent'
+      return serpent.block(v, {comment = false, nocode = true, sortkeys = true, maxlevel = 12})
+    end)
+    return ok and tostring(res) or ('<serpent error: ' .. tostring(res) .. '>')
+  end
+  return tostring(v)
 end
 
 local function probe(key)
@@ -108,6 +119,20 @@ local function run()
     for _, k in ipairs(probeKeys) do f:write(probe(k), '\n') end
   else
     f:write('API probe skipped: not in Develop module. Rerun from the Develop module.\n')
+  end
+
+  f:write('\n==== FILTERLIST (full) ====\n')
+  local okf, resf = pcall(function() return formatFull(settings.FilterList) end)
+  f:write(okf and (settings.FilterList == nil and '<nil>' or resf) or ('ERR ' .. tostring(resf)), '\n')
+
+  if module == 'develop' then
+    f:write('\n==== FILTERLIST via getValue (full) ====\n')
+    local okg, resg = LrTasks.pcall(function() return LrDevelopController.getValue('FilterList') end)
+    if okg then
+      f:write(resg == nil and '<nil>' or formatFull(resg), '\n')
+    else
+      f:write('ERR ', tostring(resg), '\n')
+    end
   end
 
   f:write('\n==== ALL SETTINGS ====\n')
