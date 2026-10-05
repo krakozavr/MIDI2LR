@@ -92,7 +92,7 @@ LrTasks.startAsyncTask(
     MIDI2LR = {PARAM_OBSERVER = {}, SERVER = {}, CLIENT = {}, RUNNING = true, AltOpt = false} --non-local but in MIDI2LR namespace
     --local variables
     local LastParam           = ''
-    local perf = {msgs = 0, params = 0, sum = 0, max = 0, last = 0} --used only if PERF_STATS
+    local perf = {msgs = 0, params = 0, coalesced = 0, applied = 0, sum = 0, max = 0, last = 0} --used only if PERF_STATS
     local UpdateParamPickup, UpdateParamNoPickup, UpdateParam
     local sendIsConnected = false --tell whether send socket is up or not
     --local constants--may edit these to change program behaviors
@@ -851,6 +851,7 @@ LrTasks.startAsyncTask(
     function UpdateParamPickup() --closure
       local paramlastmoved = {}
       local lastfullrefresh = 0
+      local lastmidi = {} --previous midi value received per parameter, to detect fader crossing LR value
       -- parameters: name of parameter, midi value to update, true if no bezel, true if ignore pickup
       return function(param, midi_value_update, silent, force)
         if LrApplication.activeCatalog():getTargetPhoto() == nil then return end--unable to update param
@@ -865,7 +866,12 @@ LrTasks.startAsyncTask(
         local current_time = LrDate.currentTime()
         local midi_val_to_lr_val = MIDIValueToLRValue(param, midi_value_update)
         local param_val = getValue(param)
-        if force or (math.abs(midi_value_update - LRValueToMIDIValue(param)) <= PICKUP_THRESHOLD) or (paramlastmoved[param] ~= nil and paramlastmoved[param] + 0.5 > current_time) then -- pickup succeeded
+        local lrmidi = LRValueToMIDIValue(param)
+        local previous = lastmidi[param]
+        lastmidi[param] = midi_value_update
+        -- crossed: values skipped by coalescing may jump over the LR value without landing in threshold
+        local crossed = previous ~= nil and (previous - lrmidi) * (midi_value_update - lrmidi) <= 0
+        if force or (math.abs(midi_value_update - lrmidi) <= PICKUP_THRESHOLD) or crossed or (paramlastmoved[param] ~= nil and paramlastmoved[param] + 0.5 > current_time) then -- pickup succeeded
           paramlastmoved[param] = current_time
           lr_value_update = midi_val_to_lr_val
           if lr_value_update ~= param_val then
@@ -984,11 +990,11 @@ LrTasks.startAsyncTask(
           local dt = now - perf.last
           if dt < 1 or not sendIsConnected then return end
           if perf.last ~= 0 then --first call only sets baseline
-            local avgms = perf.msgs > 0 and perf.sum / perf.msgs * 1000 or 0
-            MIDI2LR.SERVER:send(string.format('Log perf: %.1f msgs/s, %.1f param msgs/s, %.2f ms avg, %.2f ms max per message\n',
-                perf.msgs / dt, perf.params / dt, avgms, perf.max * 1000))
+            local avgms = perf.applied > 0 and perf.sum / perf.applied * 1000 or 0
+            MIDI2LR.SERVER:send(string.format('Log perf: %.1f msgs/s, %.1f param msgs/s, %.2f ms avg, %.2f ms max per message, %.1f applied/s, %.1f coalesced/s\n',
+                perf.msgs / dt, perf.params / dt, avgms, perf.max * 1000, perf.applied / dt, perf.coalesced / dt))
           end
-          perf.msgs, perf.params, perf.sum, perf.max, perf.last = 0, 0, 0, 0, now
+          perf.msgs, perf.params, perf.coalesced, perf.applied, perf.sum, perf.max, perf.last = 0, 0, 0, 0, 0, 0, now
         end
         local sendReconnectPending = false --only one delayed reconnect of send socket at a time
         local receiveReconnectPending = false --only one delayed reconnect of receive socket at a time
@@ -1017,6 +1023,10 @@ LrTasks.startAsyncTask(
             end,
           }
         end
+
+        -- latest value wins: onMessage only queues, the worker task below does the SDK work
+        local queue = {} --all work in arrival order: {param=, num=, isParam=true} or {param=, value=, num=}
+        local pendingIndex = {} --parameter -> index in queue of an unprocessed item after the last action
 
         local function dispatch(param, value, num) --run via LrTasks.pcall as handlers may yield
           if Database.Parameters[param] then
@@ -1074,12 +1084,7 @@ LrTasks.startAsyncTask(
           port = RECEIVE_PORT,
           mode = 'receive',
           onMessage = function(_, message) --message processor
-            local starttime
-            if PERF_STATS then
-              starttime = LrDate.currentTime()
-              perf.msgs = perf.msgs + 1
-            end
-            local ok, err = true, nil
+            if PERF_STATS then perf.msgs = perf.msgs + 1 end
             if type(message) == 'string' then
               local split = message:find(' ',1,true)
               if not split then --malformed message
@@ -1090,16 +1095,23 @@ LrTasks.startAsyncTask(
                 local param = message:sub(1,split-1)
                 local value = message:sub(split+1)
                 local num = tonumber(value)
-                ok, err = LrTasks.pcall(function() dispatch(param, value, num) end) --LrTasks.pcall as handlers may yield
+                -- must not yield or call SDK here: callbacks are serial, so just queue
+                if Database.Parameters[param] then
+                  if PERF_STATS then perf.params = perf.params + 1 end
+                  if num == nil then return end
+                  local idx = pendingIndex[param]
+                  if idx then
+                    queue[idx].num = num --latest value wins
+                    if PERF_STATS then perf.coalesced = perf.coalesced + 1 end
+                  else
+                    queue[#queue+1] = {param = param, num = num, isParam = true}
+                    pendingIndex[param] = #queue
+                  end
+                else
+                  queue[#queue+1] = {param = param, value = value, num = num}
+                  pendingIndex = {} --barrier: later values must not merge into items queued before this action
+                end
               end
-            end
-            if not ok and sendIsConnected then
-              MIDI2LR.SERVER:send('Log onMessage error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
-            end
-            if PERF_STATS then
-              local elapsed = LrDate.currentTime() - starttime
-              perf.sum = perf.sum + elapsed
-              if elapsed > perf.max then perf.max = elapsed end
             end
           end,
           onClosed = function( socket )
@@ -1129,6 +1141,55 @@ LrTasks.startAsyncTask(
         }
 
         startServer(context)
+
+        local function applyParam(param, num) --run via LrTasks.pcall as UpdateParam may yield
+          UpdateParam(param,num,false)
+          local gradeFocus = GradeFocusTable[param]
+          if gradeFocus then
+            local currentView = LrDevelopController.getActiveColorGradingView()
+            if currentView ~= '3-way' or gradeFocus == 'global' then
+              if currentView ~= gradeFocus then
+                LrDevelopController.setActiveColorGradingView(gradeFocus)
+              end
+            end
+          end
+        end
+
+        -- worker: processes queued work in arrival order; consecutive values of one parameter were coalesced
+        LrTasks.startAsyncTask(function()
+            local lastWork = 0
+            while MIDI2LR.RUNNING do
+              if #queue > 0 then
+                local q = queue
+                queue, pendingIndex = {}, {}
+                for _, item in ipairs(q) do
+                  local starttime
+                  if PERF_STATS then starttime = LrDate.currentTime() end
+                  local ok, err
+                  if item.isParam then
+                    ok, err = LrTasks.pcall(function() applyParam(item.param, item.num) end)
+                  else
+                    ok, err = LrTasks.pcall(function() dispatch(item.param, item.value, item.num) end)
+                  end
+                  if not ok and sendIsConnected then
+                    MIDI2LR.SERVER:send('Log worker error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
+                  end
+                  if PERF_STATS then
+                    local elapsed = LrDate.currentTime() - starttime
+                    perf.applied = perf.applied + 1
+                    perf.sum = perf.sum + elapsed
+                    if elapsed > perf.max then perf.max = elapsed end
+                  end
+                end
+                lastWork = LrDate.currentTime()
+                LrTasks.yield() --let Lightroom breathe between iterations
+              else
+                LrTasks.sleep(LrDate.currentTime() - lastWork < 2 and 0.01 or 0.05)
+              end
+            end
+            queue, pendingIndex = {}, {}
+          end
+        )
 
         if WIN_ENV then
           LrShell.openFilesInApp({LrPathUtils.child(_PLUGIN.path, 'Info.lua')}, LrPathUtils.child(_PLUGIN.path, 'MIDI2LR.exe'))
