@@ -102,6 +102,7 @@ LrTasks.startAsyncTask(
     local RECEIVE_PORT     = 58763
     local SEND_PORT        = 58764
     local PERF_STATS       = false -- set true to log message throughput to MIDI2LR app log once per second
+    local TRACE            = false -- set true to log per-command timing to MIDI2LR app log
     --local versions of global functions and tables, for speed
     local LRValueToMIDIValue = Limits.LRValueToMIDIValue
     local MIDIValueToLRValue = Limits.MIDIValueToLRValue
@@ -980,12 +981,16 @@ LrTasks.startAsyncTask(
             if scanScheduled then return end -- pending scan will pick up this change
             scanScheduled = true
             local obs = observer
+            local scheduled
+            if TRACE then scheduled = LrDate.currentTime() end
             LrTasks.startAsyncTask(function()
                 local interval = (LrDate.currentTime() - lastMidiApply < 0.3) and 0.25 or 0.1 --slower while MIDI is driving
                 local wait = lastScan + interval - LrDate.currentTime()
                 if wait > 0 then LrTasks.sleep(wait) end
                 scanScheduled = false --clear before scan so changes during scan schedule another pass
                 if sendIsConnected and Limits.LimitsCanBeSet() then
+                  local scanStart, sentCount
+                  if TRACE then scanStart, sentCount = LrDate.currentTime(), 0 end
                   local ok, err = LrTasks.pcall(function()
                       -- refresh crop values NOTE: this function is repeated in Limits
                       local midi_val_bottom = LRValueToMIDIValue('CropBottom')
@@ -1002,11 +1007,15 @@ LrTasks.startAsyncTask(
                           MIDI2LR.SERVER:send(string.format('%s %g\n', param, LRValueToMIDIValue(param,lrvalue)))
                           obs[param] = lrvalue
                           LastParam = param
+                          if TRACE then sentCount = sentCount + 1 end
                         end
                       end
                     end)
                   if not ok and sendIsConnected then
                     MIDI2LR.SERVER:send('Log observer error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
+                  end
+                  if TRACE and sendIsConnected then
+                    MIDI2LR.SERVER:send(string.format('Log trace observer scan waited %.0f ms, sent %d values\n', (scanStart - scheduled) * 1000, sentCount))
                   end
                 end
                 lastScan = LrDate.currentTime()
@@ -1095,7 +1104,9 @@ LrTasks.startAsyncTask(
                 local lrvalue = getValue(resetparam)
                 if type(lrvalue) == 'number' and sendIsConnected then --move controller now, don't wait for observer
                   MIDI2LR.PARAM_OBSERVER[resetparam] = lrvalue
-                  MIDI2LR.SERVER:send(string.format('%s %g\n', resetparam, LRValueToMIDIValue(resetparam, lrvalue)))
+                  local midiValue = LRValueToMIDIValue(resetparam, lrvalue)
+                  MIDI2LR.SERVER:send(string.format('%s %g\n', resetparam, midiValue))
+                  if TRACE then MIDI2LR.SERVER:send(string.format('Log trace sent %s %g to controller\n', resetparam, midiValue)) end
                 end
                 if ProgramPreferences.ClientShowBezelOnChange then
                   CU.showBezel(resetparam,lrvalue)
@@ -1140,11 +1151,11 @@ LrTasks.startAsyncTask(
                     queue[idx].num = num --latest value wins
                     if PERF_STATS then perf.coalesced = perf.coalesced + 1 end
                   else
-                    queue[#queue+1] = {param = param, num = num, isParam = true}
+                    queue[#queue+1] = {param = param, num = num, isParam = true, t = TRACE and LrDate.currentTime() or nil}
                     pendingIndex[param] = #queue
                   end
                 else
-                  queue[#queue+1] = {param = param, value = value, num = num}
+                  queue[#queue+1] = {param = param, value = value, num = num, t = TRACE and LrDate.currentTime() or nil, qlen = TRACE and #queue or nil}
                   pendingIndex = {} --barrier: later values must not merge into items queued before this action
                 end
               end
@@ -1202,6 +1213,8 @@ LrTasks.startAsyncTask(
                 for _, item in ipairs(q) do
                   local starttime
                   if PERF_STATS then starttime = LrDate.currentTime() end
+                  local tracestart
+                  if TRACE then tracestart = LrDate.currentTime() end
                   local ok, err
                   if item.isParam then
                     ok, err = LrTasks.pcall(function() applyParam(item.param, item.num) end)
@@ -1210,6 +1223,14 @@ LrTasks.startAsyncTask(
                   end
                   if not ok and sendIsConnected then
                     MIDI2LR.SERVER:send('Log worker error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
+                  end
+                  if TRACE and sendIsConnected then
+                    local waited, ran = (tracestart - item.t) * 1000, (LrDate.currentTime() - tracestart) * 1000
+                    if not item.isParam then
+                      MIDI2LR.SERVER:send(string.format('Log trace %s waited %.0f ms (queued behind %d, batch %d), ran %.0f ms\n', item.param, waited, item.qlen, #q, ran))
+                    elseif waited + ran > 50 then
+                      MIDI2LR.SERVER:send(string.format('Log trace apply %s waited %.0f ms ran %.0f ms\n', item.param, waited, ran))
+                    end
                   end
                   if PERF_STATS then
                     local elapsed = LrDate.currentTime() - starttime
