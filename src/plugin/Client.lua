@@ -1092,8 +1092,12 @@ LrTasks.startAsyncTask(
               local resetparam = param:sub(6)
               if Database.Parameters[resetparam] then -- sanitize input: is it really a parameter?
                 CU.execFOM(LrDevelopController.resetToDefault,resetparam)
+                local lrvalue = getValue(resetparam)
+                if type(lrvalue) == 'number' and sendIsConnected then --move controller now, don't wait for observer
+                  MIDI2LR.PARAM_OBSERVER[resetparam] = lrvalue
+                  MIDI2LR.SERVER:send(string.format('%s %g\n', resetparam, LRValueToMIDIValue(resetparam, lrvalue)))
+                end
                 if ProgramPreferences.ClientShowBezelOnChange then
-                  local lrvalue = getValue(resetparam)
                   CU.showBezel(resetparam,lrvalue)
                 end
                 local gradeFocus = GradeFocusTable[resetparam] -- scroll to correct view on color grading
