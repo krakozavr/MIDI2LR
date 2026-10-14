@@ -49,6 +49,9 @@
                             <origin>../../src/plugin/DebugInfo.lua</origin>
                         </distributionFile>
                         <distributionFile>
+                            <origin>../../src/plugin/DevelopSettingsProbe.lua</origin>
+                        </distributionFile>
+                        <distributionFile>
                             <origin>../../src/plugin/Donate.lua</origin>
                         </distributionFile>
                         <distributionFile>
