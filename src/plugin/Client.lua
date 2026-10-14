@@ -92,6 +92,7 @@ LrTasks.startAsyncTask(
     MIDI2LR = {PARAM_OBSERVER = {}, SERVER = {}, CLIENT = {}, RUNNING = true, AltOpt = false} --non-local but in MIDI2LR namespace
     --local variables
     local LastParam           = ''
+    local lastMidiApply       = 0 --time of last MIDI parameter application; slows observer scans while driving from MIDI
     local UpdateParamPickup, UpdateParamNoPickup, UpdateParam
     local sendIsConnected = false --tell whether send socket is up or not
     --local constants--may edit these to change program behaviors
@@ -849,6 +850,7 @@ LrTasks.startAsyncTask(
     function UpdateParamPickup() --closure
       local paramlastmoved = {}
       local lastfullrefresh = 0
+      local lastmidi = {} --previous midi value received per parameter, to detect fader crossing LR value
       -- parameters: name of parameter, midi value to update, true if no bezel, true if ignore pickup
       return function(param, midi_value_update, silent, force)
         if LrApplication.activeCatalog():getTargetPhoto() == nil then return end--unable to update param
@@ -857,13 +859,28 @@ LrTasks.startAsyncTask(
           LrApplicationView.switchToModule('develop')
           LrTasks.yield() -- need this to allow module change before value sent
         end
+        local param_val = getValue(param)
+        local min, max = Limits.GetMinMax(param, param_val)
         if Limits.Parameters[param] then
-          Limits.ClampValue(param)
+          if min ~= nil and max ~= nil then
+            local clamped = Limits.ClampValue(param, param_val, min, max)
+            if clamped ~= param_val then --value moved: fine mode window must enclose the new value
+              param_val = clamped
+              min, max = Limits.GetMinMax(param, param_val)
+            end
+          else
+            Limits.ClampValue(param)
+            param_val = getValue(param)
+          end
         end
         local current_time = LrDate.currentTime()
-        local midi_val_to_lr_val = MIDIValueToLRValue(param, midi_value_update)
-        local param_val = getValue(param)
-        if force or (math.abs(midi_value_update - LRValueToMIDIValue(param)) <= PICKUP_THRESHOLD) or (paramlastmoved[param] ~= nil and paramlastmoved[param] + 0.5 > current_time) then -- pickup succeeded
+        local midi_val_to_lr_val = MIDIValueToLRValue(param, midi_value_update, min, max)
+        local lrmidi = LRValueToMIDIValue(param, param_val, min, max)
+        local previous = lastmidi[param]
+        lastmidi[param] = midi_value_update
+        -- crossed: values skipped by coalescing may jump over the LR value without landing in threshold
+        local crossed = previous ~= nil and (previous - lrmidi) * (midi_value_update - lrmidi) <= 0
+        if force or (math.abs(midi_value_update - lrmidi) <= PICKUP_THRESHOLD) or crossed or (paramlastmoved[param] ~= nil and paramlastmoved[param] + 0.5 > current_time) then -- pickup succeeded
           paramlastmoved[param] = current_time
           lr_value_update = midi_val_to_lr_val
           if lr_value_update ~= param_val then
@@ -913,8 +930,10 @@ LrTasks.startAsyncTask(
       end
       --Don't need to clamp limited parameters without pickup, as MIDI controls will still work
       --if value is outside limits range
-      value = MIDIValueToLRValue(param, midi_value)
-      if value ~= getValue(param) then
+      local cur = getValue(param)
+      local min, max = Limits.GetMinMax(param, cur)
+      value = MIDIValueToLRValue(param, midi_value, min, max)
+      if value ~= cur then
         MIDI2LR.PARAM_OBSERVER[param] = value
         setValue(param, value, MIDI2LR.AltOpt)
         LastParam = param
@@ -951,26 +970,45 @@ LrTasks.startAsyncTask(
         local CurrentObserver
         --call following within guard for reading
         local function AdjustmentChangeObserver()
-          local lastrefresh = 0 --will be set to LrDate.currentTime() + increment to rate limit
+          local scanScheduled = false --true while a trailing scan task is pending
+          local lastScan = 0
+          local lastCrop = {}
           return function(observer) -- closure
             if not sendIsConnected then return end -- can't send
-            if Limits.LimitsCanBeSet() and lastrefresh < LrDate.currentTime() then
-              -- refresh crop values NOTE: this function is repeated in Limits
-              local midi_val_bottom = LRValueToMIDIValue('CropBottom')
-              local midi_val_top = LRValueToMIDIValue('CropTop')
-              local midi_val_left = LRValueToMIDIValue('CropLeft')
-              MIDI2LR.SERVER:send(string.format('CropBottomRight %g\nCropBottomLeft %g\nCropAll %g\nCropTopRight %g\nCropTopLeft %g\nCropMoveVertical %g\nCropMoveHorizontal %g\n',
-                  midi_val_bottom,midi_val_bottom,midi_val_bottom,midi_val_top,midi_val_top,midi_val_top,midi_val_left))
-              for param in pairs(Database.Parameters) do
-                local lrvalue = getValue(param)
-                if observer[param] ~= lrvalue and type(lrvalue) == 'number' then --testing for MIDI2LR.SERVER.send kills responsiveness
-                  MIDI2LR.SERVER:send(string.format('%s %g\n', param, LRValueToMIDIValue(param,lrvalue)))
-                  observer[param] = lrvalue
-                  LastParam = param
+            if scanScheduled then return end -- pending scan will pick up this change
+            scanScheduled = true
+            local obs = observer
+            LrTasks.startAsyncTask(function()
+                local interval = (LrDate.currentTime() - lastMidiApply < 0.3) and 0.25 or 0.1 --slower while MIDI is driving
+                local wait = lastScan + interval - LrDate.currentTime()
+                if wait > 0 then LrTasks.sleep(wait) end
+                scanScheduled = false --clear before scan so changes during scan schedule another pass
+                if sendIsConnected and Limits.LimitsCanBeSet() then
+                  local ok, err = LrTasks.pcall(function()
+                      -- refresh crop values NOTE: this function is repeated in Limits
+                      local midi_val_bottom = LRValueToMIDIValue('CropBottom')
+                      local midi_val_top = LRValueToMIDIValue('CropTop')
+                      local midi_val_left = LRValueToMIDIValue('CropLeft')
+                      if lastCrop.bottom ~= midi_val_bottom or lastCrop.top ~= midi_val_top or lastCrop.left ~= midi_val_left then
+                        lastCrop.bottom, lastCrop.top, lastCrop.left = midi_val_bottom, midi_val_top, midi_val_left
+                        MIDI2LR.SERVER:send(string.format('CropBottomRight %g\nCropBottomLeft %g\nCropAll %g\nCropTopRight %g\nCropTopLeft %g\nCropMoveVertical %g\nCropMoveHorizontal %g\n',
+                            midi_val_bottom,midi_val_bottom,midi_val_bottom,midi_val_top,midi_val_top,midi_val_top,midi_val_left))
+                      end
+                      for param in pairs(Database.Parameters) do
+                        local lrvalue = getValue(param)
+                        if obs[param] ~= lrvalue and type(lrvalue) == 'number' then --testing for MIDI2LR.SERVER.send kills responsiveness
+                          MIDI2LR.SERVER:send(string.format('%s %g\n', param, LRValueToMIDIValue(param,lrvalue)))
+                          obs[param] = lrvalue
+                          LastParam = param
+                        end
+                      end
+                    end)
+                  if not ok and sendIsConnected then
+                    MIDI2LR.SERVER:send('Log observer error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
+                  end
                 end
-              end
-              lastrefresh = LrDate.currentTime() + 0.1 --1/10 sec between refreshes
-            end
+                lastScan = LrDate.currentTime()
+              end)
           end
         end
         AdjustmentChangeObserver = AdjustmentChangeObserver() --complete closure
@@ -1005,6 +1043,10 @@ LrTasks.startAsyncTask(
           }
         end
 
+        -- latest value wins: onMessage only queues, the worker task below does the SDK work
+        local queue = {} --all work in arrival order: {param=, num=, isParam=true} or {param=, value=, num=}
+        local pendingIndex = {} --parameter -> index in queue of an unprocessed item after the last action
+
         local function dispatch(param, value, num) --run via LrTasks.pcall as handlers may yield
           if Database.Parameters[param] then
             if num == nil then return end
@@ -1036,8 +1078,25 @@ LrTasks.startAsyncTask(
               local resetparam = param:sub(6)
               if Database.Parameters[resetparam] then -- sanitize input: is it really a parameter?
                 CU.execFOM(LrDevelopController.resetToDefault,resetparam)
+                local lrvalue = getValue(resetparam)
+                if type(lrvalue) == 'number' and sendIsConnected then --move controller now, don't wait for observer
+                  MIDI2LR.PARAM_OBSERVER[resetparam] = lrvalue
+                  local midiValue = LRValueToMIDIValue(resetparam, lrvalue)
+                  MIDI2LR.SERVER:send(string.format('%s %g\n', resetparam, midiValue))
+                  local rp, rv, rm = resetparam, lrvalue, midiValue
+                  LrTasks.startAsyncTask(function()
+                      LrTasks.sleep(0.3)
+                      if not (MIDI2LR.RUNNING and sendIsConnected) then return end
+                      LrTasks.pcall(function()
+                          if Limits.LimitsCanBeSet() and getValue(rp) == rv then --user hasn't changed it since
+                            MIDI2LR.SERVER:send(string.format('%s %g\n', rp, rm))
+                          end
+                        end
+                      )
+                    end
+                  )
+                end
                 if ProgramPreferences.ClientShowBezelOnChange then
-                  local lrvalue = getValue(resetparam)
                   CU.showBezel(resetparam,lrvalue)
                 end
                 local gradeFocus = GradeFocusTable[resetparam] -- scroll to correct view on color grading
@@ -1060,7 +1119,6 @@ LrTasks.startAsyncTask(
           port = RECEIVE_PORT,
           mode = 'receive',
           onMessage = function(_, message) --message processor
-            local ok, err = true, nil
             if type(message) == 'string' then
               local split = message:find(' ',1,true)
               if not split then --malformed message
@@ -1071,11 +1129,27 @@ LrTasks.startAsyncTask(
                 local param = message:sub(1,split-1)
                 local value = message:sub(split+1)
                 local num = tonumber(value)
-                ok, err = LrTasks.pcall(function() dispatch(param, value, num) end) --LrTasks.pcall as handlers may yield
+                -- must not yield or call SDK here: callbacks are serial, so just queue
+                if Database.Parameters[param] then
+                  if num == nil then return end
+                  local idx = pendingIndex[param]
+                  if idx then
+                    queue[idx].num = num --latest value wins
+                  else
+                    queue[#queue+1] = {param = param, num = num, isParam = true}
+                    pendingIndex[param] = #queue
+                  end
+                else
+                  if param:sub(1,5) == 'Reset' and num ~= nil and num > BUTTON_ON then
+                    local target = param:sub(6)
+                    if Database.Parameters[target] and pendingIndex[target] then
+                      queue[pendingIndex[target]].skip = true --value would be overwritten by the reset
+                    end
+                  end
+                  queue[#queue+1] = {param = param, value = value, num = num}
+                  pendingIndex = {} --barrier: later values must not merge into items queued before this action
+                end
               end
-            end
-            if not ok and sendIsConnected then
-              MIDI2LR.SERVER:send('Log onMessage error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
             end
           end,
           onClosed = function( socket )
@@ -1105,6 +1179,50 @@ LrTasks.startAsyncTask(
         }
 
         startServer(context)
+
+        local function applyParam(param, num) --run via LrTasks.pcall as UpdateParam may yield
+          lastMidiApply = LrDate.currentTime()
+          UpdateParam(param,num,false)
+          local gradeFocus = GradeFocusTable[param]
+          if gradeFocus then
+            local currentView = LrDevelopController.getActiveColorGradingView()
+            if currentView ~= '3-way' or gradeFocus == 'global' then
+              if currentView ~= gradeFocus then
+                LrDevelopController.setActiveColorGradingView(gradeFocus)
+              end
+            end
+          end
+        end
+
+        -- worker: processes queued work in arrival order; consecutive values of one parameter were coalesced
+        LrTasks.startAsyncTask(function()
+            local lastWork = 0
+            while MIDI2LR.RUNNING do
+              if #queue > 0 then
+                local q = queue
+                queue, pendingIndex = {}, {}
+                for _, item in ipairs(q) do
+                  local ok, err
+                  if item.skip then
+                    ok = true
+                  elseif item.isParam then
+                    ok, err = LrTasks.pcall(function() applyParam(item.param, item.num) end)
+                  else
+                    ok, err = LrTasks.pcall(function() dispatch(item.param, item.value, item.num) end)
+                  end
+                  if not ok and sendIsConnected then
+                    MIDI2LR.SERVER:send('Log worker error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
+                  end
+                end
+                lastWork = LrDate.currentTime()
+                LrTasks.yield() --let Lightroom breathe between iterations
+              else
+                LrTasks.sleep(LrDate.currentTime() - lastWork < 2 and 0.01 or 0.05)
+              end
+            end
+            queue, pendingIndex = {}, {}
+          end
+        )
 
         if WIN_ENV then
           LrShell.openFilesInApp({LrPathUtils.child(_PLUGIN.path, 'Info.lua')}, LrPathUtils.child(_PLUGIN.path, 'MIDI2LR.exe'))
@@ -1136,7 +1254,7 @@ LrTasks.startAsyncTask(
           while MIDI2LR.RUNNING do --detect halt or reload
             LrTasks.sleep( .29 )
             Profiles.checkProfile()
-            end
+          end
         end
       end
     )
