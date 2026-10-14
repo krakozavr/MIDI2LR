@@ -1107,6 +1107,19 @@ LrTasks.startAsyncTask(
                   local midiValue = LRValueToMIDIValue(resetparam, lrvalue)
                   MIDI2LR.SERVER:send(string.format('%s %g\n', resetparam, midiValue))
                   if TRACE then MIDI2LR.SERVER:send(string.format('Log trace sent %s %g to controller\n', resetparam, midiValue)) end
+                  local rp, rv, rm = resetparam, lrvalue, midiValue
+                  LrTasks.startAsyncTask(function()
+                      LrTasks.sleep(0.3)
+                      if not (MIDI2LR.RUNNING and sendIsConnected) then return end
+                      LrTasks.pcall(function()
+                          if Limits.LimitsCanBeSet() and getValue(rp) == rv then --user hasn't changed it since
+                            MIDI2LR.SERVER:send(string.format('%s %g\n', rp, rm))
+                            if TRACE then MIDI2LR.SERVER:send(string.format('Log trace resent %s %g\n', rp, rm)) end
+                          end
+                        end
+                      )
+                    end
+                  )
                 end
                 if ProgramPreferences.ClientShowBezelOnChange then
                   CU.showBezel(resetparam,lrvalue)
@@ -1155,6 +1168,12 @@ LrTasks.startAsyncTask(
                     pendingIndex[param] = #queue
                   end
                 else
+                  if param:sub(1,5) == 'Reset' and num ~= nil and num > BUTTON_ON then
+                    local target = param:sub(6)
+                    if Database.Parameters[target] and pendingIndex[target] then
+                      queue[pendingIndex[target]].skip = true --value would be overwritten by the reset
+                    end
+                  end
                   queue[#queue+1] = {param = param, value = value, num = num, t = TRACE and LrDate.currentTime() or nil, qlen = TRACE and #queue or nil}
                   pendingIndex = {} --barrier: later values must not merge into items queued before this action
                 end
@@ -1216,7 +1235,12 @@ LrTasks.startAsyncTask(
                   local tracestart
                   if TRACE then tracestart = LrDate.currentTime() end
                   local ok, err
-                  if item.isParam then
+                  if item.skip then
+                    ok = true
+                    if TRACE and sendIsConnected then
+                      MIDI2LR.SERVER:send(string.format('Log trace skipped %s (superseded by reset)\n', item.param))
+                    end
+                  elseif item.isParam then
                     ok, err = LrTasks.pcall(function() applyParam(item.param, item.num) end)
                   else
                     ok, err = LrTasks.pcall(function() dispatch(item.param, item.value, item.num) end)
@@ -1224,7 +1248,7 @@ LrTasks.startAsyncTask(
                   if not ok and sendIsConnected then
                     MIDI2LR.SERVER:send('Log worker error: '..tostring(err):gsub('[\r\n]+',' ')..'\n')
                   end
-                  if TRACE and sendIsConnected then
+                  if TRACE and sendIsConnected and not item.skip then
                     local waited, ran = (tracestart - item.t) * 1000, (LrDate.currentTime() - tracestart) * 1000
                     if not item.isParam then
                       MIDI2LR.SERVER:send(string.format('Log trace %s waited %.0f ms (queued behind %d, batch %d), ran %.0f ms\n', item.param, waited, item.qlen, #q, ran))
